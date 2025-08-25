@@ -1,0 +1,137 @@
+name: "Fix Android manifest & Build (debug v3)"
+
+on:
+  workflow_dispatch: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v4
+
+      - name: "Set up Java 17"
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: "Install Flutter (stable)"
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: "Ensure Flutter project exists"
+        run: |
+          set -euo pipefail
+          if [ ! -f pubspec.yaml ]; then
+            echo "[init] no pubspec.yaml -> flutter create at repo root"
+            flutter create . --platforms=android --project-name anti_procrastination --org com.example.antipro
+          fi
+
+      - name: "Detect/ensure MainActivity & patch manifest safely"
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+
+          # --- 1) 尝试查找 MainActivity（同时支持 kotlin/java & kt/java） ---
+          ACT=""
+          for p in android/app/src/main/kotlin/**/MainActivity.kt android/app/src/main/java/**/MainActivity.kt android/app/src/main/kotlin/**/MainActivity.java android/app/src/main/java/**/MainActivity.java; do
+            if [ -f "$p" ]; then ACT="$p"; break; fi
+          done
+
+          # --- 2) 读取 namespace（优先 .kts） ---
+          NS=""
+          if [ -f android/app/build.gradle.kts ]; then
+            NS="$(grep -E '^[[:space:]]*namespace[[:space:]]*=' android/app/build.gradle.kts | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+          fi
+          if [ -z "$NS" ] && [ -f android/app/build.gradle ]; then
+            NS="$(grep -E '^[[:space:]]*namespace[[:space:]]*"' android/app/build.gradle | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+          fi
+
+          # --- 3) 如果找到了 MainActivity，用路径推断包名；否则等会儿用 NS 或默认值生成 ---
+          if [ -n "$ACT" ]; then
+            PKG_PATH="$(echo "$ACT" | sed -E 's#.*/(kotlin|java)/(.*)/MainActivity\.(kt|java)#\2#')"
+            PKG="$(echo "$PKG_PATH" | tr '/' '.')"
+            echo "[detected] MainActivity: $ACT"
+            echo "[detected] package from path: $PKG"
+            [ -z "$NS" ] && NS="$PKG"
+          fi
+
+          # --- 4) 兜底 namespace ---
+          if [ -z "$NS" ]; then
+            NS="com.example.antipro.anti_procrastination"
+            echo "[fallback] namespace=$NS"
+          else
+            echo "[namespace] $NS"
+          fi
+
+          # --- 5) 若没有 MainActivity，则按 NS 生成一个最小 FlutterActivity ---
+          if [ -z "$ACT" ]; then
+            PKG_DIR="android/app/src/main/kotlin/$(echo "$NS" | tr '.' '/')"
+            mkdir -p "$PKG_DIR"
+            cat > "$PKG_DIR/MainActivity.kt" <<EOF
+package $NS
+import io.flutter.embedding.android.FlutterActivity
+class MainActivity : FlutterActivity()
+EOF
+            ACT="$PKG_DIR/MainActivity.kt"
+            echo "[create] generated MainActivity at $ACT"
+          fi
+
+          # --- 6) 统一 namespace 到 Gradle ---
+          if [ -f android/app/build.gradle.kts ]; then
+            sed -i -E "s#^[[:space:]]*namespace[[:space:]]*=.*#namespace = \"$NS\"#g" android/app/build.gradle.kts || true
+          elif [ -f android/app/build.gradle ]; then
+            if grep -q '^[[:space:]]*namespace[[:space:]]*"' android/app/build.gradle; then
+              sed -i -E "s#^[[:space:]]*namespace[[:space:]]*\"[^\"]+\"#namespace \"$NS\"#g" android/app/build.gradle || true
+            else
+              sed -i -E "0,/android[[:space:]]*\{/{s/android[[:space:]]*\{/android {\n    namespace \"$NS\"/}" android/app/build.gradle || true
+            fi
+          fi
+
+          # --- 7) 修正 Manifest：替换 Application 占位符 & 固定 Launcher Activity 为 FQCN ---
+          MAN="android/app/src/main/AndroidManifest.xml"
+          if [ ! -f "$MAN" ]; then
+            echo "Manifest not found at $MAN"; exit 1
+          fi
+
+          # a) ${applicationName} -> 稳定 Application
+          sed -i 's#android:name="\${applicationName}"#android:name="io.flutter.app.FlutterApplication"#g' "$MAN"
+
+          # b) 将任意 MainActivity 名称替换成 NS.MainActivity
+          if grep -q 'android:name="[^"]*MainActivity"' "$MAN"; then
+            sed -i -E "s#android:name=\"[^\"]*MainActivity\"#android:name=\"$NS.MainActivity\"#g" "$MAN"
+          else
+            # 若缺失 Launcher Activity，则在 <application> 后面插入
+            perl -0777 -pe 's#(<application\b[^>]*>)#${1}\n        <activity android:name="'$NS'.MainActivity" android:exported="true">\n            <intent-filter>\n                <action android:name="android.intent.action.MAIN" />\n                <category android:name="android.intent.category.LAUNCHER" />\n            </intent-filter>\n        </activity>#s' -i "$MAN"
+          fi
+
+          echo "==== Summary ===="
+          echo "MainActivity: $ACT"
+          echo "Namespace   : $NS"
+          echo "Manifest snippet:"
+          grep -n 'MainActivity' "$MAN" || true
+          grep -n 'android:name=' "$MAN" | head -n 5 || true
+
+      - name: "Flutter pub get"
+        run: flutter pub get
+
+      - name: "Build debug APK"
+        run: |
+          set -euo pipefail
+          flutter clean
+          flutter build apk --debug
+          find build/app/outputs -type f -name "*.apk" -print
+
+      - name: "Upload APK"
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-fixed.apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error
