@@ -1,0 +1,109 @@
+name: Build Android APK v0.3.3 - Foreground Service AOD (arm64)
+
+on:
+  workflow_dispatch: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Create Flutter project if missing (no overwrite)
+        run: |
+          set -euo pipefail
+          if [ ! -f pubspec.yaml ]; then
+            flutter create . --platforms=android --project-name anti_procrastination --org com.example.antipro
+          fi
+
+      - name: Generate temp keystore & key.properties (sign release)
+        run: |
+          set -euo pipefail
+          mkdir -p android/app
+          keytool -genkey -noprompt \
+            -keystore android/app/upload-keystore.jks \
+            -alias upload \
+            -storepass android -keypass android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Temp, OU=CI, O=CI, L=, S=, C=US"
+          cat > android/key.properties <<'PROPS'
+          storePassword=android
+          keyPassword=android
+          keyAlias=upload
+          storeFile=upload-keystore.jks
+          PROPS
+
+      - name: Inject native (Kotlin Service + Lock Activity + Manifest)
+        run: |
+          set -euo pipefail
+          ORG_PATH="com/example/antipro"
+          mkdir -p android/app/src/main/kotlin/$ORG_PATH
+          mkdir -p android/app/src/main/res/layout
+
+          cat > android/app/src/main/kotlin/$ORG_PATH/MainActivity.kt <<'KOT'
+          (…此处粘贴我们前一条消息里 MainActivity.kt 的完整内容…)
+          KOT
+
+          cat > android/app/src/main/kotlin/$ORG_PATH/FocusForegroundService.kt <<'KOT'
+          (…此处粘贴 FocusForegroundService.kt 的完整内容…)
+          KOT
+
+          cat > android/app/src/main/kotlin/$ORG_PATH/FocusLockActivity.kt <<'KOT'
+          (…此处粘贴 FocusLockActivity.kt 的完整内容…)
+          KOT
+
+          cat > android/app/src/main/res/layout/activity_focus_lock.xml <<'XML'
+          (…此处粘贴 activity_focus_lock.xml 的完整内容…)
+          XML
+
+          cat > android/app/src/main/AndroidManifest.xml <<'XML'
+          (…此处粘贴 AndroidManifest.xml 的完整内容…)
+          XML
+
+      - name: Flutter pub get
+        run: |
+          set -euo pipefail
+          flutter pub get
+
+      - name: Build arm64 release (tree-shake icons)
+        run: |
+          set -euo pipefail
+          flutter build apk --release --target-platform=android-arm64 --tree-shake-icons
+
+      - name: List outputs (diagnostic)
+        run: |
+          set -euo pipefail
+          ls -lah build/app/outputs/flutter-apk || true
+
+      - name: Verify arm64 artifact exists
+        id: check_arm64
+        run: |
+          set -euo pipefail
+          if [ -f build/app/outputs/flutter-apk/app-arm64-v8a-release.apk ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload arm64 APK
+        if: ${{ steps.check_arm64.outputs.found == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-arm64-v8a-release.apk
+          path: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+
+      - name: Fail if missing artifact
+        if: ${{ steps.check_arm64.outputs.found != 'true' }}
+        run: |
+          echo '::error::No arm64 release APK found. Check build logs.'
+          exit 1
