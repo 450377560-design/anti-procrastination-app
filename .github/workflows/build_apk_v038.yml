@@ -63,7 +63,7 @@ jobs:
           storeFile=upload-keystore.jks
           PROPS
 
-      - name: Inject native (Kotlin: Service/Lock/AOD + Nightly Planner + Manifest)
+      - name: "Inject native (Kotlin: Service/Lock/AOD + Nightly Planner + Manifest)"
         run: |
           set -euo pipefail
           ORG_PATH="com/example/antipro"
