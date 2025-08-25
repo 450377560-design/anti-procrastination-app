@@ -1,15 +1,4 @@
 import React from "react";
-
-/**
- * Foreground Service + AOD-style Focus — Native Pack v0.3.3 (ARM64 only)
- *
- * Fix: Your workflow failed on YAML line 9. Likely causes: a stray TAB, or non‑ASCII dash in the `name:` line.
- * This version normalizes to pure ASCII and re-indents with spaces.
- *
- * Copy block (1) exactly into `.github/workflows/build_apk_v033.yml` and run it.
- * The job injects native Kotlin files and builds an arm64 release APK only.
- */
-
 export default function Pack_v033() {
   return (
     <div className="p-6 space-y-8">
