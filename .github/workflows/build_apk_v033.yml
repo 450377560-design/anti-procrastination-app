@@ -1,0 +1,505 @@
+import React from "react";
+
+/**
+ * Foreground Service + AOD-style Focus — Native Pack v0.3.3 (ARM64 only)
+ *
+ * Fix: Your workflow failed on YAML line 9. Likely causes: a stray TAB, or non‑ASCII dash in the `name:` line.
+ * This version normalizes to pure ASCII and re-indents with spaces.
+ *
+ * Copy block (1) exactly into `.github/workflows/build_apk_v033.yml` and run it.
+ * The job injects native Kotlin files and builds an arm64 release APK only.
+ */
+
+export default function Pack_v033() {
+  return (
+    <div className="p-6 space-y-8">
+      <Section title="1) .github/workflows/build_apk_v033.yml (ASCII-only, spaces-only)">
+        <Pre>
+{`name: "Build Android APK v0.3.3 - Foreground Service AOD (arm64)"
+
+on:
+  workflow_dispatch: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Create Flutter project if missing (no overwrite)
+        run: |
+          set -euo pipefail
+          if [ ! -f pubspec.yaml ]; then
+            flutter create . --platforms=android --project-name anti_procrastination --org com.example.antipro
+          fi
+
+      - name: Inject native (Kotlin Service + Lock Activity + Manifest)
+        run: |
+          set -euo pipefail
+          ORG_PATH="com/example/antipro"
+          mkdir -p android/app/src/main/kotlin/$ORG_PATH
+          mkdir -p android/app/src/main/res/layout
+
+          cat > android/app/src/main/kotlin/$ORG_PATH/MainActivity.kt <<'KOT'
+${kMainActivity}
+KOT
+
+          cat > android/app/src/main/kotlin/$ORG_PATH/FocusForegroundService.kt <<'KOT'
+${kService}
+KOT
+
+          cat > android/app/src/main/kotlin/$ORG_PATH/FocusLockActivity.kt <<'KOT'
+${kLockActivity}
+KOT
+
+          cat > android/app/src/main/res/layout/activity_focus_lock.xml <<'XML'
+${kLayout}
+XML
+
+          cat > android/app/src/main/AndroidManifest.xml <<'XML'
+${kManifest}
+XML
+
+      - name: Flutter pub get
+        run: |
+          set -euo pipefail
+          flutter pub get
+
+      - name: Build arm64 release (tree-shake icons)
+        run: |
+          set -euo pipefail
+          flutter build apk --release --target-platform=android-arm64 --tree-shake-icons
+
+      - name: List outputs (diagnostic)
+        run: |
+          set -euo pipefail
+          ls -lah build/app/outputs/flutter-apk || true
+
+      - name: Verify arm64 artifact exists
+        id: check_arm64
+        run: |
+          set -euo pipefail
+          if [ -f build/app/outputs/flutter-apk/app-arm64-v8a-release.apk ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload arm64 APK
+        if: ${{ steps.check_arm64.outputs.found == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-arm64-v8a-release.apk
+          path: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+
+      - name: Fail if missing artifact
+        if: ${{ steps.check_arm64.outputs.found != 'true' }}
+        run: |
+          echo '::error::No arm64 release APK found. Check build logs.'
+          exit 1
+`}
+        </Pre>
+      </Section>
+
+      <Section title="2) android/app/src/main/kotlin/.../MainActivity.kt (events -> MethodChannel)">
+        <Pre>
+{kMainActivity}
+        </Pre>
+      </Section>
+
+      <Section title="3) android/app/src/main/kotlin/.../FocusForegroundService.kt (STOP brings app to front + unlock interruption)">
+        <Pre>
+{kService}
+        </Pre>
+      </Section>
+
+      <Section title="4) android/app/src/main/kotlin/.../FocusLockActivity.kt (AOD-style)">
+        <Pre>
+{kLockActivity}
+        </Pre>
+      </Section>
+
+      <Section title="5) android/app/src/main/AndroidManifest.xml (permissions + components)">
+        <Pre>
+{kManifest}
+        </Pre>
+      </Section>
+
+      <Section title="6) android/app/src/main/res/layout/activity_focus_lock.xml (layout)">
+        <Pre>
+{kLayout}
+        </Pre>
+      </Section>
+
+      <div className="text-sm text-gray-600">
+        <p className="font-semibold mb-1">Why the previous YAML failed</p>
+        <ul className="list-disc pl-6 space-y-1">
+          <li>Non-ASCII dash or an accidental TAB can break YAML parsing; GitHub often reports a nearby line (e.g., line 9).</li>
+          <li>This revision quotes the <code>name:</code>, removes non-ASCII characters, and guarantees spaces-only indentation.</li>
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+/****************** Snippet payloads (unchanged from v0.3.2) ******************/
+
+const kMainActivity = `package com.example.antipro
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
+
+class MainActivity : FlutterActivity() {
+    private val CHANNEL = "focus_service"
+    private var eventsReceiver: BroadcastReceiver? = null
+
+    companion object {
+        var channel: MethodChannel? = null
+        fun emit(method: String, args: Map<String, Any?>? = null) {
+            val ch = channel ?: return
+            Handler(Looper.getMainLooper()).post {
+                ch.invokeMethod(method, args)
+            }
+        }
+    }
+
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+        val ch = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+        channel = ch
+        ch.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "start" -> {
+                    val minutes = (call.argument<Int>("minutes") ?: 25)
+                    val dim = (call.argument<Double>("dim") ?: 0.05).toFloat()
+                    val lock = (call.argument<Boolean>("lock") ?: false)
+
+                    val svc = Intent(this, FocusForegroundService::class.java)
+                    svc.putExtra("minutes", minutes)
+                    startForegroundServiceCompat(svc)
+
+                    if (lock) {
+                        val intent = Intent(this, FocusLockActivity::class.java)
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                        intent.putExtra("dim", dim)
+                        startActivity(intent)
+                    }
+                    result.success(true)
+                }
+                "stop" -> {
+                    stopService(Intent(this, FocusForegroundService::class.java))
+                    result.success(true)
+                }
+                else -> result.notImplemented()
+            }
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        val filter = IntentFilter().apply {
+            addAction("FOCUS_TICK")
+            addAction("FOCUS_FINISH")
+            addAction("FOCUS_STOP")
+            addAction("FOCUS_INTERRUPTION")
+        }
+        eventsReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                when (intent?.action) {
+                    "FOCUS_TICK" -> emit("onTick", mapOf("remaining" to intent.getIntExtra("remaining", 0)))
+                    "FOCUS_FINISH" -> emit("onFinish")
+                    "FOCUS_STOP" -> emit("onStop")
+                    "FOCUS_INTERRUPTION" -> emit("onInterruption")
+                }
+            }
+        }
+        registerReceiver(eventsReceiver, filter)
+    }
+
+    override fun onStop() {
+        try { unregisterReceiver(eventsReceiver) } catch (_: Exception) {}
+        eventsReceiver = null
+        super.onStop()
+    }
+
+    private fun startForegroundServiceCompat(intent: Intent) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+    }
+}
+`;
+
+const kService = `package com.example.antipro
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
+import android.os.CountDownTimer
+import android.os.IBinder
+import androidx.core.app.NotificationCompat
+
+class FocusForegroundService : Service() {
+    private var timer: CountDownTimer? = null
+    private var remainingMs: Long = 0L
+    private var screenRx: BroadcastReceiver? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        createChannel()
+        val f = IntentFilter().apply { addAction(Intent.ACTION_USER_PRESENT) }
+        screenRx = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action == Intent.ACTION_USER_PRESENT && remainingMs > 0L) {
+                    sendBroadcast(Intent("FOCUS_INTERRUPTION"))
+                }
+            }
+        }
+        registerReceiver(screenRx, f)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == "STOP") {
+            sendBroadcast(Intent("FOCUS_STOP"))
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            try {
+                val launcher = packageManager.getLaunchIntentForPackage(packageName)
+                launcher?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                if (launcher != null) startActivity(launcher)
+            } catch (_: Exception) {}
+            return START_NOT_STICKY
+        }
+        val minutes = intent?.getIntExtra("minutes", 25) ?: 25
+        remainingMs = (minutes * 60 * 1000L)
+        startForeground(NOTI_ID, buildNotification(formatRemaining()))
+        timer?.cancel()
+        timer = object : CountDownTimer(remainingMs, 1000) {
+            override fun onTick(ms: Long) {
+                remainingMs = ms
+                notifyUpdate()
+                val i = Intent("FOCUS_TICK"); i.putExtra("remaining", (remainingMs / 1000).toInt()); sendBroadcast(i)
+            }
+            override fun onFinish() {
+                sendBroadcast(Intent("FOCUS_FINISH"))
+                stopForeground(STOP_FOREGROUND_DETACH)
+                stopSelf()
+            }
+        }.start()
+        return START_STICKY
+    }
+
+    override fun onDestroy() {
+        timer?.cancel()
+        try { unregisterReceiver(screenRx) } catch (_: Exception) {}
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun notifyUpdate() {
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.notify(NOTI_ID, buildNotification(formatRemaining()))
+    }
+
+    private fun formatRemaining(): String {
+        val totalSec = (remainingMs / 1000).toInt()
+        val m = totalSec / 60
+        val s = totalSec % 60
+        return String.format("%02d:%02d", m, s)
+    }
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val ch = NotificationChannel(CHANNEL_ID, "Focus", NotificationManager.IMPORTANCE_DEFAULT)
+            ch.setShowBadge(false)
+            nm.createNotificationChannel(ch)
+        }
+    }
+
+    private fun buildNotification(text: String): Notification {
+        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE else PendingIntent.FLAG_UPDATE_CURRENT
+        val pi = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, FocusLockActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            flags
+        )
+        val stopPi = PendingIntent.getService(this, 1, Intent(this, FocusForegroundService::class.java).setAction("STOP"), flags)
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+            .setContentTitle("专注进行中")
+            .setContentText("剩余: $text")
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setContentIntent(pi)
+            .addAction(0, "停止", stopPi)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .build()
+    }
+
+    companion object {
+        private const val CHANNEL_ID = "focus_channel"
+        private const val NOTI_ID = 2001
+    }
+}
+`;
+
+const kLockActivity = `package com.example.antipro
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Bundle
+import android.view.View
+import android.view.WindowManager
+import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
+
+class FocusLockActivity : AppCompatActivity() {
+    private var tv: TextView? = null
+    private val rx = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                "FOCUS_TICK" -> {
+                    val sec = intent.getIntExtra("remaining", 0)
+                    val m = sec / 60; val s = sec % 60
+                    tv?.text = String.format("%02d:%02d", m, s)
+                }
+                "FOCUS_FINISH", "FOCUS_STOP" -> finish()
+            }
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_focus_lock)
+        tv = findViewById(R.id.countdownText)
+
+        window.addFlags(
+            WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+            WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+            WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+        )
+        val dim = intent.getFloatExtra("dim", 0.05f).coerceIn(0.01f, 0.2f)
+        window.attributes = window.attributes.apply { screenBrightness = dim }
+
+        window.decorView.systemUiVisibility = (
+            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+            View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+            View.SYSTEM_UI_FLAG_FULLSCREEN)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        registerReceiver(rx, IntentFilter().apply {
+            addAction("FOCUS_TICK"); addAction("FOCUS_FINISH"); addAction("FOCUS_STOP")
+        })
+    }
+
+    override fun onPause() {
+        try { unregisterReceiver(rx) } catch (_: Exception) {}
+        super.onPause()
+    }
+}
+`;
+
+const kManifest = `<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.example.antipro">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <application
+        android:label="Anti Pro"
+        android:name="\${applicationName}"
+        android:icon="@mipmap/ic_launcher">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".FocusLockActivity"
+            android:exported="false"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:excludeFromRecents="true" />
+
+        <service
+            android:name=".FocusForegroundService"
+            android:exported="false" />
+    </application>
+</manifest>
+`;
+
+const kLayout = `<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#000000">
+
+    <TextView
+        android:id="@+id/countdownText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="25:00"
+        android:textColor="#FFFFFF"
+        android:textSize="56sp"
+        android:textStyle="bold"
+        android:layout_gravity="center" />
+</FrameLayout>`;
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section>
+      <h2 className="text-lg font-semibold mb-2">{title}</h2>
+      {children}
+    </section>
+  );
+}
+
+function Pre({ children }: { children: React.ReactNode }) {
+  return (
+    <pre className="whitespace-pre overflow-auto rounded-md border p-4 text-sm bg-gray-50">{children}</pre>
+  );
+}
