@@ -1,0 +1,576 @@
+name: Bootstrap & Build Android APK v1 (no push, fat debug)
+
+on:
+  workflow_dispatch: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      # 1) 没有 pubspec.yaml 就初始化 Flutter 工程
+      - name: Bootstrap Flutter project if missing
+        run: |
+          set -euo pipefail
+          if [ ! -f pubspec.yaml ]; then
+            echo "No pubspec.yaml, creating Flutter app at repo root..."
+            flutter create . --platforms=android --project-name anti_procrastination --org com.example.antipro
+          else
+            echo "Found pubspec.yaml, skip create."
+          fi
+
+      # 2) 写入 Flutter 代码
+      - name: Write Flutter sources
+        run: |
+          set -euo pipefail
+          mkdir -p lib
+
+          cat > lib/focus_bridge.dart <<'DART'
+          import 'package:flutter/services.dart';
+
+          class FocusBridge {
+            static const MethodChannel _ch = MethodChannel('focus_service');
+
+            static void init({void Function()? onInterruption}) {
+              _onInterruption = onInterruption;
+              _ch.setMethodCallHandler((call) async {
+                if (call.method == 'onInterruption') _onInterruption?.call();
+                return;
+              });
+            }
+
+            static void Function()? _onInterruption;
+
+            static Future<void> start({int minutes = 25, bool lock = true}) =>
+                _ch.invokeMethod('startFocus', {'minutes': minutes, 'lock': lock});
+            static Future<void> stop() => _ch.invokeMethod('stopFocus');
+
+            static Future<void> plannerEnable({int hour = 21, int minute = 30}) =>
+                _ch.invokeMethod('plannerEnable', {'hour': hour, 'minute': minute});
+            static Future<void> plannerDisable() => _ch.invokeMethod('plannerDisable');
+          }
+          DART
+
+          cat > lib/main.dart <<'DART'
+          import 'package:flutter/material.dart';
+          import 'focus_bridge.dart';
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            FocusBridge.init(onInterruption: () {
+              _InterruptionUI.lastContext?.let((ctx) => _InterruptionUI.show(ctx));
+            });
+            runApp(const AntiProApp());
+          }
+
+          class AntiProApp extends StatelessWidget {
+            const AntiProApp({super.key});
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'Anti Pro',
+                theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.teal),
+                home: const HomePage(),
+              );
+            }
+          }
+
+          class HomePage extends StatefulWidget {
+            const HomePage({super.key});
+            @override
+            State<HomePage> createState() => _HomePageState();
+          }
+
+          class _HomePageState extends State<HomePage> {
+            int minutes = 25;
+            bool lock = true;
+            TimeOfDay plannerTime = const TimeOfDay(hour: 21, minute: 30);
+            bool plannerOn = false;
+
+            @override
+            Widget build(BuildContext context) {
+              _InterruptionUI.lastContext = context;
+              return Scaffold(
+                appBar: AppBar(title: const Text('Anti Pro - 专注')),
+                body: ListView(
+                  padding: const EdgeInsets.all(16),
+                  children: [
+                    const Text('专注设置', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                    Row(children: [
+                      const Text('时长(分钟)：'),
+                      Expanded(
+                        child: Slider(
+                          value: minutes.toDouble(), min: 5, max: 180, divisions: 175, label: '$minutes',
+                          onChanged: (v) => setState(() => minutes = v.round()),
+                        ),
+                      ),
+                      Switch(value: lock, onChanged: (v) => setState(() => lock = v)),
+                      const Text('锁屏'),
+                    ]),
+                    Row(children: [
+                      ElevatedButton(
+                        onPressed: () => FocusBridge.start(minutes: minutes, lock: lock),
+                        child: const Text('开始专注'),
+                      ),
+                      const SizedBox(width: 12),
+                      OutlinedButton(onPressed: FocusBridge.stop, child: const Text('停止')),
+                    ]),
+                    const SizedBox(height: 24),
+                    const Text('一日之计在于昨晚', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                    Row(children: [
+                      TextButton(
+                        onPressed: () async {
+                          final t = await showTimePicker(context: context, initialTime: plannerTime);
+                          if (t != null) setState(() => plannerTime = t);
+                        },
+                        child: Text('提醒时间：${plannerTime.format(context)}'),
+                      ),
+                      const SizedBox(width: 12),
+                      Switch(
+                        value: plannerOn,
+                        onChanged: (v) async {
+                          setState(() => plannerOn = v);
+                          if (v) {
+                            await FocusBridge.plannerEnable(hour: plannerTime.hour, minute: plannerTime.minute);
+                          } else {
+                            await FocusBridge.plannerDisable();
+                          }
+                        },
+                      ),
+                      Text(plannerOn ? '已开启' : '已关闭'),
+                    ]),
+                    const SizedBox(height: 8),
+                    const Text('每天睡前用1分钟整理明日清单；通知会在设定时间发送。'),
+                  ],
+                ),
+              );
+            }
+          }
+
+          extension _LetExt<T> on T { R let<R>(R Function(T it) block) => block(this); }
+
+          class _InterruptionUI {
+            static BuildContext? lastContext;
+            static Future<void> show(BuildContext context) async {
+              final reasons = ['消息提醒','刷短视频','查看邮件','接电话/开会','生理需求','其他'];
+              String? picked;
+              await showModalBottomSheet(
+                context: context,
+                builder: (ctx) => SafeArea(
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    const ListTile(title: Text('本次专注被打断，原因是？')),
+                    for (final r in reasons)
+                      ListTile(title: Text(r), onTap: () { picked = r; Navigator.pop(ctx); }),
+                    const SizedBox(height: 8),
+                  ]),
+                ),
+              );
+              if (picked != null) debugPrint('Interruption reason: $picked'); // TODO: 落库统计
+            }
+          }
+          DART
+
+      # 3) 写入 Android 原生与清单
+      - name: "Inject Android native and manifest"
+        run: |
+          set -euo pipefail
+          ORG_PATH="com/example/antipro"
+          mkdir -p android/app/src/main/kotlin/$ORG_PATH
+          mkdir -p android/app/src/main/res/layout
+
+          # MainActivity.kt
+          cat > android/app/src/main/kotlin/$ORG_PATH/MainActivity.kt <<'KOT'
+          package com.example.antipro
+
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.os.Build
+          import android.os.Bundle
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+
+          class MainActivity : FlutterActivity() {
+              private val CHANNEL = "focus_service"
+              private var methodChannel: MethodChannel? = null
+              private var interruptionReceiver: BroadcastReceiver? = null
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  val ch = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+                  methodChannel = ch
+                  ch.setMethodCallHandler { call, result ->
+                      when (call.method) {
+                          "startFocus" -> {
+                              val minutes = (call.argument<Int>("minutes") ?: 25)
+                              val lock = (call.argument<Boolean>("lock") ?: false)
+                              val svc = Intent(this, FocusForegroundService::class.java).apply { putExtra("minutes", minutes) }
+                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(svc) else startService(svc)
+                              if (lock) {
+                                  val lockIntent = Intent(this, FocusLockActivity::class.java)
+                                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                                  startActivity(lockIntent)
+                              }
+                              result.success(true)
+                          }
+                          "stopFocus" -> {
+                              val stop = Intent(this, FocusForegroundService::class.java).setAction(FocusForegroundService.ACTION_STOP)
+                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(stop) else startService(stop)
+                              result.success(true)
+                          }
+                          "plannerEnable" -> {
+                              val hour = call.argument<Int>("hour") ?: 21
+                              val minute = call.argument<Int>("minute") ?: 30
+                              NightlyPlanner.enable(this, hour, minute); result.success(true)
+                          }
+                          "plannerDisable" -> { NightlyPlanner.disable(this); result.success(true) }
+                          else -> result.notImplemented()
+                      }
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val filter = IntentFilter(FocusForegroundService.ACTION_INTERRUPTED_BROADCAST)
+                  interruptionReceiver = object : BroadcastReceiver() {
+                      override fun onReceive(context: Context?, intent: Intent?) {
+                          methodChannel?.invokeMethod("onInterruption", null)
+                      }
+                  }
+                  registerReceiver(interruptionReceiver, filter)
+              }
+
+              override fun onDestroy() {
+                  try { unregisterReceiver(interruptionReceiver) } catch (_: Exception) {}
+                  interruptionReceiver = null
+                  super.onDestroy()
+              }
+          }
+          KOT
+
+          # FocusForegroundService.kt
+          cat > android/app/src/main/kotlin/$ORG_PATH/FocusForegroundService.kt <<'KOT'
+          package com.example.antipro
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.os.Build
+          import android.os.IBinder
+          import androidx.core.app.NotificationCompat
+
+          class FocusForegroundService : Service() {
+              companion object {
+                  const val CHANNEL_ID = "focus_channel"
+                  const val NOTI_ID = 11001
+                  const val ACTION_STOP = "com.example.antipro.FOCUS_STOP"
+                  const val ACTION_INTERRUPTED_BROADCAST = "com.example.antipro.FOCUS_INTERRUPTED"
+              }
+              override fun onBind(intent: Intent?): IBinder? = null
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  ensureChannel()
+                  val stopIntent = Intent(this, FocusForegroundService::class.java).apply { action = ACTION_STOP }
+                  val pStop = PendingIntent.getService(this, 2001, stopIntent,
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+
+                  val launch = packageManager.getLaunchIntentForPackage(packageName)?.apply {
+                      addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                  }
+                  val pLaunch = PendingIntent.getActivity(this, 2002, launch,
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+
+                  val n: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
+                      .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                      .setContentTitle("专注进行中")
+                      .setContentText("点击停止将返回 App")
+                      .setOngoing(true)
+                      .setPriority(NotificationCompat.PRIORITY_LOW)
+                      .addAction(0, "停止", pStop)
+                      .setContentIntent(pLaunch)
+                      .build()
+                  startForeground(NOTI_ID, n)
+
+                  if (intent?.action == ACTION_STOP) {
+                      sendBroadcast(Intent(ACTION_INTERRUPTED_BROADCAST))
+                      stopForeground(STOP_FOREGROUND_REMOVE)
+                      stopSelf()
+                      if (launch != null) startActivity(launch)
+                      return START_NOT_STICKY
+                  }
+                  return START_STICKY
+              }
+              private fun ensureChannel() {
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      val nm = getSystemService(NotificationManager::class.java)
+                      val ch = NotificationChannel(CHANNEL_ID, "Focus Session", NotificationManager.IMPORTANCE_LOW).apply {
+                          setShowBadge(false); enableVibration(false); enableLights(false)
+                      }
+                      nm.createNotificationChannel(ch)
+                  }
+              }
+          }
+          KOT
+
+          # FocusLockActivity.kt（低亮度 AOD）
+          cat > android/app/src/main/kotlin/$ORG_PATH/FocusLockActivity.kt <<'KOT'
+          package com.example.antipro
+
+          import android.app.Activity
+          import android.os.Bundle
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.TextView
+
+          class FocusLockActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_focus_lock)
+                  window.addFlags(
+                      WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON or
+                      WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                      WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                  )
+                  window.attributes = window.attributes.apply { screenBrightness = 0.05f }
+                  window.decorView.systemUiVisibility = (
+                      View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY or
+                      View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
+                      View.SYSTEM_UI_FLAG_FULLSCREEN
+                  )
+                  findViewById<TextView>(R.id.countdownText).text = "专注中"
+              }
+          }
+          KOT
+
+          # NightlyPlanner.kt
+          cat > android/app/src/main/kotlin/$ORG_PATH/NightlyPlanner.kt <<'KOT'
+          package com.example.antipro
+
+          import android.app.AlarmManager
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Build
+          import androidx.core.app.NotificationCompat
+          import java.util.Calendar
+
+          object NightlyPlanner {
+              private const val PREFS = "antipro"
+              private const val KEY_ENABLED = "planner_enabled"
+              private const val KEY_HOUR = "planner_hour"
+              private const val KEY_MINUTE = "planner_minute"
+              private const val NOTI_ID = 3001
+              private const val CHANNEL_ID = "planner_channel"
+
+              fun enable(context: Context, hour: Int, minute: Int) {
+                  val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                  p.edit().putBoolean(KEY_ENABLED, true).putInt(KEY_HOUR, hour).putInt(KEY_MINUTE, minute).apply()
+                  ensureChannel(context); schedule(context, hour, minute)
+              }
+              fun disable(context: Context) {
+                  val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                  p.edit().putBoolean(KEY_ENABLED, false).apply()
+                  cancel(context)
+              }
+              fun rescheduleFromPrefs(context: Context) {
+                  val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                  if (p.getBoolean(KEY_ENABLED, false)) schedule(context, p.getInt(KEY_HOUR, 21), p.getInt(KEY_MINUTE, 30))
+              }
+              private fun schedule(context: Context, hour: Int, minute: Int) {
+                  val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                  val pi = pending(context)
+                  val cal = Calendar.getInstance().apply {
+                      timeInMillis = System.currentTimeMillis()
+                      set(Calendar.HOUR_OF_DAY, hour); set(Calendar.MINUTE, minute); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+                  }
+                  var trigger = cal.timeInMillis
+                  if (trigger <= System.currentTimeMillis()) trigger += 24 * 60 * 60 * 1000L
+                  am.setInexactRepeating(AlarmManager.RTC_WAKEUP, trigger, AlarmManager.INTERVAL_DAY, pi)
+              }
+              private fun cancel(context: Context) {
+                  val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                  am.cancel(pending(context))
+              }
+              fun showReminder(context: Context) {
+                  ensureChannel(context)
+                  val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE else PendingIntent.FLAG_UPDATE_CURRENT
+                  val openApp = PendingIntent.getActivity(
+                      context, 0,
+                      context.packageManager.getLaunchIntentForPackage(context.packageName)!!
+                          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                      flags
+                  )
+                  val n = NotificationCompat.Builder(context, CHANNEL_ID)
+                      .setSmallIcon(android.R.drawable.ic_menu_edit)
+                      .setContentTitle("一日之计在于昨晚")
+                      .setContentText("现在用1分钟整理明日任务清单吧")
+                      .setContentIntent(openApp)
+                      .setAutoCancel(true)
+                      .build()
+                  nm.notify(NOTI_ID, n)
+              }
+              private fun pending(context: Context): PendingIntent {
+                  val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE else PendingIntent.FLAG_UPDATE_CURRENT
+                  return PendingIntent.getBroadcast(context, 1001, Intent(context, NightlyPlannerReceiver::class.java), flags)
+              }
+              private fun ensureChannel(context: Context) {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                      val ch = NotificationChannel(CHANNEL_ID, "Nightly Planner", NotificationManager.IMPORTANCE_DEFAULT)
+                      ch.setShowBadge(false); nm.createNotificationChannel(ch)
+                  }
+              }
+          }
+          KOT
+
+          # NightlyPlannerReceiver.kt
+          cat > android/app/src/main/kotlin/$ORG_PATH/NightlyPlannerReceiver.kt <<'KOT'
+          package com.example.antipro
+
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.Intent.ACTION_BOOT_COMPLETED
+
+          class NightlyPlannerReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent?) {
+                  if (intent?.action == ACTION_BOOT_COMPLETED) NightlyPlanner.rescheduleFromPrefs(context)
+                  else NightlyPlanner.showReminder(context)
+              }
+          }
+          KOT
+
+          # AOD 布局
+          cat > android/app/src/main/res/layout/activity_focus_lock.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent" android:layout_height="match_parent"
+              android:background="#000000" android:keepScreenOn="true">
+              <TextView
+                  android:id="@+id/countdownText"
+                  android:layout_width="wrap_content" android:layout_height="wrap_content"
+                  android:text="专注中" android:textColor="#FFFFFFFF" android:textSize="48sp"
+                  android:textStyle="bold" android:layout_gravity="center" />
+          </FrameLayout>
+          XML
+
+          # Manifest（去掉 package=，声明组件与权限）
+          cat > android/app/src/main/AndroidManifest.xml <<'XML'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+              <application
+                  android:label="Anti Pro"
+                  android:name="${applicationName}"
+                  android:icon="@mipmap/ic_launcher">
+                  <meta-data android:name="flutterEmbedding" android:value="2" />
+
+                  <activity
+                      android:name="com.example.antipro.MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:theme="@style/LaunchTheme"
+                      android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+                      android:hardwareAccelerated="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity
+                      android:name="com.example.antipro.FocusLockActivity"
+                      android:exported="false"
+                      android:showWhenLocked="true"
+                      android:turnScreenOn="true"
+                      android:excludeFromRecents="true" />
+
+                  <service
+                      android:name="com.example.antipro.FocusForegroundService"
+                      android:exported="false" />
+
+                  <receiver
+                      android:name="com.example.antipro.NightlyPlannerReceiver"
+                      android:enabled="true"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          XML
+
+      # 4) Gradle 稳健化（namespace/sdk/deps/FS watch）
+      - name: "Harden Gradle config"
+        run: |
+          set -euo pipefail
+          echo "org.gradle.vfs.watch=false" >> android/gradle.properties || true
+
+          APP="android/app/build.gradle.kts"
+          # 统一 namespace，避免 R 冲突
+          sed -i 's/namespace *= *".*"/namespace = "com.example.antipro"/' "$APP" || true
+          sed -i 's/compileSdk *= *[0-9][0-9]*/compileSdk = 35/' "$APP" || true
+          sed -i 's/targetSdk *= *[0-9][0-9]*/targetSdk = 35/' "$APP" || true
+          grep -q 'minSdk' "$APP" || sed -i 's/defaultConfig *{/defaultConfig {\n        minSdk = 24/' "$APP" || true
+
+          # 确保有 core-ktx（含 NotificationCompat）
+          if ! grep -q 'androidx.core:core-ktx' "$APP"; then
+            sed -i 's/dependencies *{/dependencies {\n    implementation("androidx.core:core-ktx:1.13.1")/' "$APP"
+          fi
+
+          # 移除任何残留的 package="..."（AGP 8 不支持）
+          shopt -s globstar || true
+          for f in android/app/src/**/AndroidManifest.xml; do
+            [ -f "$f" ] || continue
+            sed -i 's/\s*package="[^"]*"//g' "$f" || true
+          done
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      # 5) 构建 Debug APK（胖包，不做体积优化）
+      - name: Build fat Debug APK
+        run: |
+          flutter clean
+          flutter build apk --debug
+          find build/app/outputs -type f -name "*.apk" -print
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug.apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error
