@@ -4,7 +4,7 @@ export default function Pack_v033() {
     <div className="p-6 space-y-8">
       <Section title="1) .github/workflows/build_apk_v033.yml (ASCII-only, spaces-only)">
         <Pre>
-{`name: "Build Android APK v0.3.3 - Foreground Service AOD (arm64)"
+name:"Build Android APK v0.3.3 - Foreground Service AOD (arm64)"
 
 on:
   workflow_dispatch: {}
@@ -96,7 +96,7 @@ XML
         run: |
           echo '::error::No arm64 release APK found. Check build logs.'
           exit 1
-`}
+          
         </Pre>
       </Section>
 
