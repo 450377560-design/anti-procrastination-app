@@ -1,0 +1,680 @@
+name: Build Android APK (Flutter, one-click)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Create Flutter project if missing
+        run: |
+          if [ ! -f pubspec.yaml ]; then
+            flutter create . --platforms=android --project-name anti_procrastination --org com.example.antipro
+          fi
+
+      - name: Inject MVP code (pubspec.yaml + lib/main.dart)
+        run: |
+          cat > pubspec.yaml <<'YAML'
+          name: anti_procrastination
+          description: Anti-procrastination MVP
+          publish_to: "none"
+
+          environment:
+            sdk: ">=3.3.0 <4.0.0"
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            shared_preferences: ^2.2.3
+            cupertino_icons: ^1.0.6
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+            flutter_lints: ^3.0.0
+
+          flutter:
+            uses-material-design: true
+          YAML
+
+          mkdir -p lib
+          cat > lib/main.dart <<'DART'
+          // Anti-Procrastination Android MVP (Flutter) — v0.1.2 (fixes)
+          // 修复：
+          // 1) 去掉错误的反斜杠，正确使用 Dart 字符串插值 ${}
+          // 2) 外层改用双引号，允许内部出现中文/单引号
+          // 3) _TemplateCard 字段避免与 Widget.key 冲突
+
+          import 'dart:async';
+          import 'dart:convert';
+          import 'package:flutter/material.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(const AntiProcrastinationApp());
+          }
+
+          class Task {
+            Task({
+              required this.id,
+              required this.title,
+              required this.nextStep,
+              required this.steps,
+              this.importance = 3,
+              this.completed = false,
+            });
+            final String id;
+            String title;
+            String nextStep;
+            List<String> steps;
+            int importance;
+            bool completed;
+            Map<String, dynamic> toJson() => {
+                  'id': id,
+                  'title': title,
+                  'nextStep': nextStep,
+                  'steps': steps,
+                  'importance': importance,
+                  'completed': completed,
+                };
+            static Task fromJson(Map<String, dynamic> j) => Task(
+                  id: j['id'],
+                  title: j['title'] ?? '',
+                  nextStep: j['nextStep'] ?? '',
+                  steps: (j['steps'] as List).map((e) => e.toString()).toList(),
+                  importance: j['importance'] ?? 3,
+                  completed: j['completed'] ?? false,
+                );
+          }
+
+          class FocusStats {
+            int minutesTotal;
+            int sessionCount;
+            int streakDays;
+            FocusStats({this.minutesTotal = 0, this.sessionCount = 0, this.streakDays = 1});
+            Map<String, dynamic> toJson() => {
+                  'minutesTotal': minutesTotal,
+                  'sessionCount': sessionCount,
+                  'streakDays': streakDays,
+                };
+            static FocusStats fromJson(Map<String, dynamic> j) => FocusStats(
+                minutesTotal: j['minutesTotal'] ?? 0,
+                sessionCount: j['sessionCount'] ?? 0,
+                streakDays: j['streakDays'] ?? 1);
+          }
+
+          String uid() => DateTime.now().millisecondsSinceEpoch.toString() +
+              (1000 + (DateTime.now().microsecondsSinceEpoch % 8999)).toString();
+
+          final Map<String, Map<String, dynamic>> kTemplates = {
+            '写作': {
+              'next': '打开文档并写 100 字',
+              'steps': ['列 3 条大纲', '写出第一段草稿', '补 3 个参考小点']
+            },
+            '备课': {
+              'next': '整理 3 张关键幻灯片',
+              'steps': ['确定教学目标', '写课堂提问', '添加 1 个示例']
+            },
+            '编码': {
+              'next': '打开编辑器并实现 10 行',
+              'steps': ['跑通项目', '写 1 个单元测试', '提交带说明的 commit']
+            },
+            '备考': {
+              'next': '刷 10 题/看 1 页',
+              'steps': ['列知识点清单', '做 10 题', '复盘错题 3 条']
+            },
+            '科研': {
+              'next': '打开数据表并写 3 条观察',
+              'steps': ['整理实验记录', '画 1 张趋势图', '写 100 字结果草稿']
+            },
+          };
+
+          final Map<String, List<String>> kBlockers = {
+            '不知道第一步': ['打开文件，写一个小标题', '把任务改成 2 分钟版本：写 50 字/列 3 点', '先写最容易的段落，不求顺序'],
+            '任务太大': ['自动切成 5 个小片段，先勾选一个开始', '限定 10 分钟先扫一眼资料', '先做“准备动作”：打开工具、加载数据'],
+            '怕做不好': ['启用“草稿模式”：5 分钟不准退格', '写一个“最差可用”版本', '先写提纲，用 * 占位难点'],
+            '信息不足': ['限时 5 分钟检索：关键词×3', '只找 1 个权威来源做起点', '写下你知道的，再标注 ? 位置'],
+            '被打断': ['恢复仪式：回看上一句+继续 10 分钟', '写下刚才做到哪一步', '切回全屏，静音 20 分钟'],
+          };
+
+          class AppModel extends ChangeNotifier {
+            AppModel();
+            List<Task> tasks = [];
+            List<String> mitIds = [];
+            String? activeTaskId;
+            FocusStats stats = FocusStats();
+            String reviewDone = '';
+            String reviewObstacle = '';
+            String reviewNext = '';
+            static const _keyTasks = 'tasks';
+            static const _keyMit = 'mit';
+            static const _keyActive = 'activeTaskId';
+            static const _keyStats = 'stats';
+            Future<void> load() async {
+              final sp = await SharedPreferences.getInstance();
+              final t = sp.getString(_keyTasks);
+              if (t != null) {
+                tasks = (jsonDecode(t) as List).map((e) => Task.fromJson(e)).toList();
+              } else {
+                tasks = [
+                  Task(id: uid(), title: '论文结果部分初稿', nextStep: kTemplates['写作']!['next'], steps: List<String>.from(kTemplates['写作']!['steps']), importance: 5),
+                  Task(id: uid(), title: '课堂讲义完善', nextStep: kTemplates['备课']!['next'], steps: List<String>.from(kTemplates['备课']!['steps']), importance: 4),
+                  Task(id: uid(), title: '复盘上周实验', nextStep: kTemplates['科研']!['next'], steps: List<String>.from(kTemplates['科研']!['steps']), importance: 4),
+                ];
+              }
+              mitIds = (sp.getStringList(_keyMit) ?? tasks.take(3).map((e) => e.id).toList());
+              activeTaskId = sp.getString(_keyActive) ?? (tasks.isNotEmpty ? tasks.first.id : null);
+              final s = sp.getString(_keyStats);
+              if (s != null) stats = FocusStats.fromJson(jsonDecode(s));
+              notifyListeners();
+            }
+            Future<void> save() async {
+              final sp = await SharedPreferences.getInstance();
+              await sp.setString(_keyTasks, jsonEncode(tasks.map((e) => e.toJson()).toList()));
+              await sp.setStringList(_keyMit, mitIds);
+              if (activeTaskId != null) await sp.setString(_keyActive, activeTaskId!);
+              await sp.setString(_keyStats, jsonEncode(stats.toJson()));
+            }
+            Task? get activeTask => tasks.where((e) => e.id == activeTaskId).firstOrNull;
+            void addTaskFromTemplate(String title, String kind) {
+              final tpl = kTemplates[kind]!;
+              final t = Task(id: uid(), title: title, nextStep: tpl['next'], steps: List<String>.from(tpl['steps']));
+              tasks.insert(0, t);
+              notifyListeners();
+              save();
+            }
+            void updateNextStep(String text) {
+              final t = activeTask;
+              if (t != null) {
+                t.nextStep = text;
+                notifyListeners();
+                save();
+              }
+            }
+            void toggleMit(String id, bool checked) {
+              if (checked) {
+                if (!mitIds.contains(id)) mitIds.add(id);
+              } else {
+                mitIds.removeWhere((e) => e == id);
+              }
+              notifyListeners();
+              save();
+            }
+            void setActive(String id) {
+              activeTaskId = id;
+              notifyListeners();
+              save();
+            }
+            void applyReviewAndReturnHome() {
+              if (reviewNext.trim().isNotEmpty) updateNextStep(reviewNext.trim());
+              reviewDone = reviewObstacle = reviewNext = '';
+              notifyListeners();
+              save();
+            }
+            void increaseStats(int usedMinutes) {
+              stats.minutesTotal += usedMinutes;
+              stats.sessionCount += 1;
+              stats.streakDays += 1;
+              notifyListeners();
+              save();
+            }
+          }
+
+          extension FirstOrNull<E> on Iterable<E> {
+            E? get firstOrNull => isEmpty ? null : first;
+          }
+
+          class AntiProcrastinationApp extends StatefulWidget {
+            const AntiProcrastinationApp({super.key});
+            @override
+            State<AntiProcrastinationApp> createState() => _AntiProcrastinationAppState();
+          }
+
+          class _AntiProcrastinationAppState extends State<AntiProcrastinationApp> {
+            final model = AppModel();
+            int index = 0;
+            @override
+            void initState() {
+              super.initState();
+              model.load();
+            }
+            void go(int i) => setState(() => index = i);
+            @override
+            Widget build(BuildContext context) {
+              return AnimatedBuilder(
+                animation: model,
+                builder: (context, _) {
+                  return MaterialApp(
+                    debugShowCheckedModeBanner: false,
+                    title: 'Anti-Procrastination',
+                    theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo, brightness: Brightness.light),
+                    home: Scaffold(
+                      appBar: AppBar(title: const Text('Anti-Procrastination — MVP'), actions: [IconButton(icon: const Icon(Icons.alarm), onPressed: () {}, tooltip: '勿扰（占位）')]),
+                      body: IndexedStack(index: index, children: [
+                        HomePage(model: model, onStartQuick: () => setState(() => index = 1)),
+                        FocusPage(model: model, onEnd: (usedMinutes) { model.increaseStats(usedMinutes); setState(() => index = 2); }),
+                        ReviewPage(model: model, onSaved: () => setState(() => index = 0)),
+                        LibraryPage(model: model),
+                      ]),
+                      bottomNavigationBar: NavigationBar(
+                        selectedIndex: index,
+                        onDestinationSelected: go,
+                        destinations: const [
+                          NavigationDestination(icon: Icon(Icons.home_outlined), selectedIcon: Icon(Icons.home), label: '首页'),
+                          NavigationDestination(icon: Icon(Icons.timer_outlined), selectedIcon: Icon(Icons.timer), label: '专注'),
+                          NavigationDestination(icon: Icon(Icons.checklist_outlined), selectedIcon: Icon(Icons.checklist), label: '复盘'),
+                          NavigationDestination(icon: Icon(Icons.auto_awesome), selectedIcon: Icon(Icons.auto_awesome), label: '模板/数据'),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              );
+            }
+          }
+
+          class HomePage extends StatelessWidget {
+            const HomePage({super.key, required this.model, required this.onStartQuick});
+            final AppModel model;
+            final VoidCallback onStartQuick;
+            @override
+            Widget build(BuildContext context) {
+              final active = model.activeTask;
+              return SingleChildScrollView(
+                padding: const EdgeInsets.all(16),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Card(
+                    clipBehavior: Clip.antiAlias,
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        const Text('下一步启动卡片', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
+                        const SizedBox(height: 12),
+                        const Text('当前任务', style: TextStyle(color: Colors.grey)),
+                        const SizedBox(height: 8),
+                        DropdownButton<String>(
+                          value: model.activeTaskId,
+                          isExpanded: true,
+                          hint: const Text('选择任务'),
+                          items: model.tasks.map((t) => DropdownMenuItem<String>(value: t.id, child: Text(t.title))).toList(),
+                          onChanged: (v) { if (v != null) model.setActive(v); },
+                        ),
+                        const SizedBox(height: 12),
+                        Container(
+                          decoration: BoxDecoration(border: Border.all(color: Colors.black12), borderRadius: BorderRadius.circular(16)),
+                          padding: const EdgeInsets.all(16),
+                          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                            const Text('下一步', style: TextStyle(color: Colors.grey)),
+                            const SizedBox(height: 6),
+                            Text(active?.nextStep ?? '选择一个任务', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+                            const SizedBox(height: 12),
+                            Wrap(spacing: 8, runSpacing: 8, children: [
+                              ElevatedButton.icon(onPressed: onStartQuick, icon: const Icon(Icons.play_arrow), label: const Text('开始 25 分钟')),
+                              OutlinedButton.icon(onPressed: () => _quickDemo(context), icon: const Icon(Icons.timelapse_outlined), label: const Text('试跑 60 秒')),
+                              FilledButton.tonal(onPressed: () => _openStuckDialog(context, model), child: const Text('我卡住了')),
+                            ]),
+                          ]),
+                        ),
+                      ]),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Card(
+                    clipBehavior: Clip.antiAlias,
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        const Text('今日三件事（MIT）', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
+                        const SizedBox(height: 12),
+                        ...model.tasks.take(5).map((t) => Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 6),
+                              child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                                Row(children: [
+                                  Checkbox(value: model.mitIds.contains(t.id), onChanged: (v) => model.toggleMit(t.id, v ?? false)),
+                                  Text(t.title),
+                                ]),
+                                Container(padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4), decoration: BoxDecoration(border: Border.all(color: Colors.black12), borderRadius: BorderRadius.circular(24)), child: Text('优先级 ${t.importance}'))
+                              ]),
+                            )),
+                        const SizedBox(height: 12),
+                        Align(alignment: Alignment.centerLeft, child: OutlinedButton.icon(onPressed: () => _openNewTaskSheet(context, model), icon: const Icon(Icons.add), label: const Text('新建任务')))
+                      ]),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Card(
+                    clipBehavior: Clip.antiAlias,
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        const Text('进度与习惯', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
+                        const SizedBox(height: 12),
+                        Row(children: [
+                          Expanded(child: _Stat(num: model.stats.minutesTotal.toString(), label: '累计专注（分钟）')),
+                          Expanded(child: _Stat(num: model.stats.sessionCount.toString(), label: '完成时段（个）')),
+                          Expanded(child: _Stat(num: model.stats.streakDays.toString(), label: '连胜天数')),
+                        ])
+                      ]),
+                    ),
+                  ),
+                ]),
+              );
+            }
+            void _quickDemo(BuildContext context) {
+              final shell = context.findAncestorStateOfType<_AntiProcrastinationAppState>();
+              shell?.setState(() => shell.index = 1);
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('在“专注”里切换为演示模式 60 秒')));
+            }
+          }
+
+          void _openNewTaskSheet(BuildContext context, AppModel model) {
+            final titleCtrl = TextEditingController();
+            String kind = kTemplates.keys.first;
+            showModalBottomSheet(
+              context: context,
+              isScrollControlled: true,
+              builder: (context) {
+                return Padding(
+                  padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      const Text('新建任务', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
+                      const SizedBox(height: 12),
+                      TextField(controller: titleCtrl, decoration: const InputDecoration(labelText: '任务标题', border: OutlineInputBorder())),
+                      const SizedBox(height: 12),
+                      DropdownButtonFormField<String>(
+                        decoration: const InputDecoration(labelText: '选择模板', border: OutlineInputBorder()),
+                        value: kind,
+                        items: kTemplates.keys.map((k) => DropdownMenuItem(value: k, child: Text(k))).toList(),
+                        onChanged: (v) => kind = v ?? kind,
+                      ),
+                      const SizedBox(height: 12),
+                      Align(alignment: Alignment.centerRight, child: FilledButton.icon(onPressed: () { if (titleCtrl.text.trim().isEmpty) return; model.addTaskFromTemplate(titleCtrl.text.trim(), kind); Navigator.pop(context); }, icon: const Icon(Icons.add), label: const Text('创建'))),
+                    ]),
+                  ),
+                );
+              },
+            );
+          }
+
+          void _openStuckDialog(BuildContext context, AppModel model) {
+            String? blocker;
+            showDialog(
+              context: context,
+              builder: (context) {
+                return AlertDialog(
+                  title: const Text('我卡住了'),
+                  content: StatefulBuilder(
+                    builder: (context, setState) => Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      const Text('卡点类型'),
+                      const SizedBox(height: 8),
+                      DropdownButton<String>(
+                        value: blocker,
+                        hint: const Text('选择一个卡点'),
+                        isExpanded: true,
+                        items: kBlockers.keys.map((k) => DropdownMenuItem(value: k, child: Text(k))).toList(),
+                        onChanged: (v) => setState(() => blocker = v),
+                      ),
+                      const SizedBox(height: 8),
+                      if (blocker != null)
+                        Wrap(spacing: 8, runSpacing: 8, children: kBlockers[blocker]!.map((s) => OutlinedButton(onPressed: () { model.updateNextStep(s); Navigator.pop(context); }, child: Text(s))).toList()),
+                    ]),
+                  ),
+                  actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('关闭'))],
+                );
+              },
+            );
+          }
+
+          class _Stat extends StatelessWidget {
+            const _Stat({required this.num, required this.label});
+            final String num;
+            final String label;
+            @override
+            Widget build(BuildContext context) {
+              return Container(
+                margin: const EdgeInsets.symmetric(horizontal: 6),
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(border: Border.all(color: Colors.black12), borderRadius: BorderRadius.circular(16)),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(num, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 4),
+                  Text(label, style: const TextStyle(color: Colors.grey)),
+                ]),
+              );
+            }
+          }
+
+          class FocusPage extends StatefulWidget {
+            const FocusPage({super.key, required this.model, required this.onEnd});
+            final AppModel model;
+            final void Function(int usedMinutes) onEnd;
+            @override
+            State<FocusPage> createState() => _FocusPageState();
+          }
+
+          class _FocusPageState extends State<FocusPage> {
+            bool running = false;
+            bool demoMode = false;
+            int plannedMinutes = 25;
+            int remainingSeconds = 25 * 60;
+            Timer? _timer;
+            String? quitReason;
+            Task? get active => widget.model.activeTask;
+            void _start() {
+              setState(() { remainingSeconds = (demoMode ? 60 : plannedMinutes * 60); running = true; });
+              _timer?.cancel();
+              _timer = Timer.periodic(const Duration(seconds: 1), (t) {
+                if (!running) return;
+                if (remainingSeconds <= 0) {
+                  t.cancel();
+                  setState(() => running = false);
+                  widget.onEnd(demoMode ? 1 : plannedMinutes);
+                } else {
+                  setState(() => remainingSeconds -= 1);
+                }
+              });
+            }
+            void _pause() => setState(() => running = false);
+            void _resume() => setState(() => running = true);
+            void _endSession() async {
+              _timer?.cancel();
+              setState(() => running = false);
+              if (!mounted) return;
+              await showDialog(
+                context: context,
+                builder: (context) => AlertDialog(
+                  title: const Text('现在结束或退出？'),
+                  content: StatefulBuilder(
+                    builder: (context, setState) => Column(mainAxisSize: MainAxisSize.min, children: [
+                      DropdownButton<String>(
+                        value: quitReason,
+                        hint: const Text('选择一个原因（用于给出即时策略）'),
+                        isExpanded: true,
+                        items: [
+                          ...kBlockers.keys.map((k) => DropdownMenuItem(value: k, child: Text(k))).toList(),
+                          const DropdownMenuItem(value: '临时来电', child: Text('临时来电')),
+                          const DropdownMenuItem(value: '疲惫/分心', child: Text('疲惫/分心')),
+                        ],
+                        onChanged: (v) => setState(() => quitReason = v),
+                      ),
+                      const SizedBox(height: 8),
+                      if (quitReason != null && kBlockers.containsKey(quitReason))
+                        Wrap(spacing: 8, runSpacing: 8, children: kBlockers[quitReason]!.take(2).map((s) => OutlinedButton(onPressed: () { widget.model.updateNextStep(s); Navigator.pop(context); }, child: Text(s))).toList()),
+                    ]),
+                  ),
+                  actions: [
+                    TextButton(onPressed: () { Navigator.pop(context); _resume(); }, child: const Text('继续坚持')),
+                    TextButton(onPressed: () { Navigator.pop(context); }, child: const Text('结束本次')),
+                  ],
+                ),
+              );
+            }
+            @override
+            void dispose() { _timer?.cancel(); super.dispose(); }
+            String _format(int seconds) { final m = (seconds ~/ 60).toString().padLeft(2, '0'); final s = (seconds % 60).toString().padLeft(2, '0'); return '$m:$s'; }
+            @override
+            Widget build(BuildContext context) {
+              return Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.center, children: [
+                  Row(children: const [Icon(Icons.timer_outlined), SizedBox(width: 8), Text('专注时段', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600)), Spacer()]),
+                  const SizedBox(height: 12),
+                  Align(alignment: Alignment.centerLeft, child: Text("当前任务：${active?.title ?? '未选择'}", style: const TextStyle(color: Colors.grey))),
+                  const SizedBox(height: 12),
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Column(children: [
+                        Text(_format(remainingSeconds), style: const TextStyle(fontSize: 56, fontWeight: FontWeight.w700, letterSpacing: 1.5)),
+                        const SizedBox(height: 4),
+                        Text("本次目标：${active?.nextStep ?? '——'}", style: const TextStyle(color: Colors.grey)),
+                        const SizedBox(height: 16),
+                        Wrap(spacing: 8, runSpacing: 8, children: [
+                          if (!running) ElevatedButton.icon(onPressed: _start, icon: const Icon(Icons.play_arrow), label: const Text('开始')) else FilledButton.tonalIcon(onPressed: _pause, icon: const Icon(Icons.pause), label: const Text('暂停')),
+                          OutlinedButton(onPressed: _resume, child: const Text('继续')),
+                          OutlinedButton.icon(onPressed: _endSession, icon: const Icon(Icons.stop), label: const Text('结束/退出')),
+                          TextButton(onPressed: () => _openStuckDialog(context, widget.model), child: const Text('我卡住了')),
+                        ]),
+                        const SizedBox(height: 16),
+                        Row(children: [
+                          Expanded(child: _Labeled(label: '时长（分钟）', child: DropdownButton<int>(isExpanded: true, value: plannedMinutes, items: const [10, 15, 20, 25, 45, 50].map((n) => DropdownMenuItem(value: n, child: Text("$n"))).toList(), onChanged: (v) => setState(() => plannedMinutes = v ?? plannedMinutes)))),
+                          const SizedBox(width: 12),
+                          Expanded(child: _Labeled(label: '演示模式（60 秒）', child: SwitchListTile(value: demoMode, onChanged: (v) => setState(() => demoMode = v), contentPadding: EdgeInsets.zero, title: const Text('启用')))),
+                        ]),
+                      ]),
+                    ),
+                  ),
+                ]),
+              );
+            }
+          }
+
+          class _Labeled extends StatelessWidget {
+            const _Labeled({required this.label, required this.child});
+            final String label;
+            final Widget child;
+            @override
+            Widget build(BuildContext context) { return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(label, style: const TextStyle(color: Colors.grey)), const SizedBox(height: 6), child]); }
+          }
+
+          class ReviewPage extends StatelessWidget {
+            const ReviewPage({super.key, required this.model, required this.onSaved});
+            final AppModel model;
+            final VoidCallback onSaved;
+            @override
+            Widget build(BuildContext context) {
+              final doneCtrl = TextEditingController(text: model.reviewDone);
+              final obsCtrl = TextEditingController(text: model.reviewObstacle);
+              final nextCtrl = TextEditingController(text: model.reviewNext);
+              return Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Row(children: const [Icon(Icons.checklist), SizedBox(width: 8), Text('结束复盘', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600))]),
+                  const SizedBox(height: 12),
+                  TextField(controller: doneCtrl, maxLines: 3, decoration: const InputDecoration(hintText: '完成了什么？', border: OutlineInputBorder())),
+                  const SizedBox(height: 12),
+                  TextField(controller: obsCtrl, maxLines: 3, decoration: const InputDecoration(hintText: '遇到什么阻碍？', border: OutlineInputBorder())),
+                  const SizedBox(height: 12),
+                  TextField(controller: nextCtrl, maxLines: 2, decoration: const InputDecoration(hintText: '下一步是什么？（越小越好）', border: OutlineInputBorder())),
+                  const SizedBox(height: 12),
+                  Row(children: [
+                    FilledButton(onPressed: () { model.reviewDone = doneCtrl.text; model.reviewObstacle = obsCtrl.text; model.reviewNext = nextCtrl.text; model.applyReviewAndReturnHome(); onSaved(); ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已保存并更新下一步'))); }, child: const Text('保存并返回首页')),
+                    const SizedBox(width: 12),
+                    OutlinedButton(onPressed: () { doneCtrl.clear(); obsCtrl.clear(); nextCtrl.clear(); }, child: const Text('清空')),
+                  ])
+                ]),
+              );
+            }
+          }
+
+          class LibraryPage extends StatelessWidget {
+            const LibraryPage({super.key, required this.model});
+            final AppModel model;
+            @override
+            Widget build(BuildContext context) {
+              return ListView(padding: const EdgeInsets.all(16), children: [
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Row(children: const [Icon(Icons.auto_awesome), SizedBox(width: 8), Text('任务模板', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600))]),
+                      const SizedBox(height: 12),
+                      Wrap(spacing: 12, runSpacing: 12, children: kTemplates.keys.map((name) => _TemplateCard(templateName: name, onUse: () => model.addTaskFromTemplate('$name 任务', name))).toList()),
+                    ]),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Row(children: const [Icon(Icons.calendar_month), SizedBox(width: 8), Text('本周过程性指标（示例）', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600))]),
+                      const SizedBox(height: 12),
+                      _MetricRow(label: '启动成功率', value: model.stats.sessionCount > 0 ? 0.8 : 0.4),
+                      const SizedBox(height: 8),
+                      _MetricRow(label: '专注完成率', value: model.stats.sessionCount > 0 ? 0.75 : 0.35),
+                      const SizedBox(height: 8),
+                      _MetricRow(label: '从打开到开始（秒）', value: 0.6),
+                      const SizedBox(height: 4),
+                      const Text('注：以上为示例计算，后续可用真实埋点替换。', style: TextStyle(color: Colors.grey)),
+                    ]),
+                  ),
+                ),
+              ]);
+            }
+          }
+
+          class _TemplateCard extends StatelessWidget {
+            const _TemplateCard({required this.templateName, required this.onUse});
+            final String templateName; // 模板名（避免与 Widget.key 冲突）
+            final VoidCallback onUse;
+            @override
+            Widget build(BuildContext context) {
+              final tpl = kTemplates[templateName]!;
+              return Container(
+                width: 260,
+                decoration: BoxDecoration(border: Border.all(color: Colors.black12), borderRadius: BorderRadius.circular(16)),
+                padding: const EdgeInsets.all(16),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text(templateName, style: const TextStyle(fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 6),
+                  Text("开局：${tpl['next']}", style: const TextStyle(color: Colors.grey)),
+                  const SizedBox(height: 10),
+                  OutlinedButton(onPressed: onUse, child: const Text('用此模板新建')),
+                ]),
+              );
+            }
+          }
+
+          class _MetricRow extends StatelessWidget {
+            const _MetricRow({required this.label, required this.value});
+            final String label;
+            final double value;
+            @override
+            Widget build(BuildContext context) { return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(label), const SizedBox(height: 6), LinearProgressIndicator(value: value, minHeight: 8, borderRadius: BorderRadius.circular(8))]); }
+          }
+          DART
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build debug APK
+        run: flutter build apk --debug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug.apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
