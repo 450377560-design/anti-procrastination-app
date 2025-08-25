@@ -1,0 +1,86 @@
+name: Fix Android manifest & Build (debug)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Ensure Flutter project exists
+        run: |
+          if [ ! -f pubspec.yaml ]; then
+            flutter create . --platforms=android --project-name anti_procrastination --org com.example.antipro
+          fi
+
+      - name: Detect MainActivity package & fix manifest
+        run: |
+          set -euo pipefail
+          ACT=$(ls android/app/src/main/kotlin/**/MainActivity.kt | head -n1)
+          if [ -z "${ACT:-}" ]; then
+            echo "MainActivity.kt not found"; exit 1
+          fi
+          PKG=$(echo "$ACT" | sed -E 's#.*/kotlin/(.*)/MainActivity\.kt#\1#' | tr '/' '.')
+          echo "Detected MainActivity FQCN: $PKG.MainActivity"
+
+          MAN=android/app/src/main/AndroidManifest.xml
+          if [ ! -f "$MAN" ]; then
+            echo "Manifest not found at $MAN"; exit 1
+          fi
+
+          # 1) 修正 Activity 为全限定名
+          if grep -q 'android:name="[^"]*MainActivity"' "$MAN"; then
+            sed -i -E "s#android:name=\"[^\"]*MainActivity\"#android:name=\"$PKG.MainActivity\"#g" "$MAN"
+          else
+            # 没写就补一份（极少见）
+            awk '
+              /<application/ && !seen++ {
+                print;
+                print "        <activity android:name=\"'"$PKG"'.MainActivity\" android:exported=\"true\">";
+                print "            <intent-filter><action android:name=\"android.intent.action.MAIN\" /><category android:name=\"android.intent.category.LAUNCHER\" /></intent-filter>";
+                print "        </activity>";
+                next
+              }1' "$MAN" > "$MAN.tmp" && mv "$MAN.tmp" "$MAN"
+          fi
+
+          # 2) 将 ${applicationName} 替换为稳定的 Application 类名，避免占位符失效
+          sed -i 's#android:name="\${applicationName}"#android:name="io.flutter.app.FlutterApplication"#g' "$MAN"
+
+          # 3) 统一 namespace（与实际包一致更稳）
+          APP_KTS=android/app/build.gradle.kts
+          if [ -f "$APP_KTS" ]; then
+            sed -i -E "s#namespace *= *\"[^\"]*\"#namespace = \"$PKG\"#g" "$APP_KTS" || true
+          fi
+
+          echo "==== Patched Manifest ===="
+          grep -n 'MainActivity' "$MAN" || true
+          grep -n 'android:name=' "$MAN" | head -n 5 || true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build debug APK
+        run: |
+          flutter clean
+          flutter build apk --debug
+          find build/app/outputs -type f -name "*.apk" -print
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-fixed.apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
